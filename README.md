@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Local Windows AI Email Enrichment System
 
 A modular, production-ready contact email enrichment pipeline utilizing **Ollama** and **Gemma 4B** (with seamless configuration-only upgrades to 12B/32B). It reads contacts from a CSV file, searches the web, extracts target email addresses using local LLM inference, validates them, and logs runtime metrics.
@@ -70,3 +71,7 @@ Modify configurations in the `.env` file or directly in the environment:
 - **Model not found**: Ensure you ran `ollama pull gemma:4b` (or whichever model is configured in `.env`).
 - **DDG Rate Limits / Blocking**: Increase `SEARCH_DELAY` in `.env` to make queries less frequent.
 - **Missing Input File**: If `data/contacts.csv` is missing, running `main.py` once will automatically generate a sample template.
+=======
+# email-enrichment-system
+A modular AI-powered email enrichment system built with Python, Ollama, and Gemma for extracting and validating business emails from public web content.
+>>>>>>> 472ced9fa6a030a58f828a8b71394a7ae0cf4f35
