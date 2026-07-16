@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific: data and output files
+*.xlsx
+*.xls
+*.csv
+data/
+output/
+logs/
