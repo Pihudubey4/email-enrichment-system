@@ -4,6 +4,11 @@ import time
 import threading
 from collections import deque
 from typing import List, Dict, Any
+from pathlib import Path
+
+# Add root folder to path to allow importing config
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import config
 
 class TerminalUI:
     """
@@ -21,6 +26,14 @@ class TerminalUI:
         self.found = 0
         self.not_found = 0
         self.errors = 0
+        
+        # Detailed metrics
+        self.fast_path = 0
+        self.ai_bypass = 0
+        self.ai_inference = 0
+        self.ollama_timeouts = 0
+        self.ddg_queries = 0
+        self.active_workers: Dict[str, Dict[str, Any]] = {}  # thread_name -> {"contact": str, "stage": str, "start_time": float}
         
         # Keep track of recent activities (thread-safe deque with max length 5)
         self.recent_activities = deque(maxlen=5)
@@ -46,10 +59,41 @@ class TerminalUI:
             self.recent_activities.append(activity)
             self._render()
 
+    def set_worker_status(self, thread_name: str, contact: str, stage: str) -> None:
+        """Sets the active status of a thread worker slot and triggers a redraw."""
+        with self._lock:
+            self.active_workers[thread_name] = {
+                "contact": contact,
+                "stage": stage,
+                "start_time": time.time()
+            }
+            self._render()
+
+    def clear_worker_status(self, thread_name: str) -> None:
+        """Clears the active status of a thread worker slot and triggers a redraw."""
+        with self._lock:
+            if thread_name in self.active_workers:
+                del self.active_workers[thread_name]
+            self._render()
+
+    def increment_metric(self, name: str) -> None:
+        """Thread-safely increments one of the advanced metrics and triggers a redraw."""
+        with self._lock:
+            if name == "fast_path":
+                self.fast_path += 1
+            elif name == "ai_bypass":
+                self.ai_bypass += 1
+            elif name == "ai_inference":
+                self.ai_inference += 1
+            elif name == "ollama_timeouts":
+                self.ollama_timeouts += 1
+            elif name == "ddg_queries":
+                self.ddg_queries += 1
+            self._render()
+
     def _render(self) -> None:
         """Clears screen and renders TUI dashboard."""
         # Use terminal ANSI sequences to clear screen and home cursor
-        # This is faster and avoids flicker compared to os.system('cls')
         sys.stdout.write("\033[H\033[J")
         
         elapsed = time.time() - self.start_time
@@ -84,7 +128,7 @@ class TerminalUI:
         lines.append("========================================================================")
         lines.append(f" File:        {self.filename}")
         lines.append(f" Workers:     {self.max_workers} active concurrent streams")
-        lines.append(" Speed Cap:   300 RPM (max queries/minute)")
+        lines.append(f" Model:       {config.MODEL_NAME} (Timeout: {config.TIMEOUT}s)")
         lines.append("------------------------------------------------------------------------")
         lines.append("")
         lines.append(" Progress:")
@@ -93,9 +137,34 @@ class TerminalUI:
         lines.append(f"   Rate:      {rate_per_hour} contacts/hour  |  ETA: {eta_str}")
         lines.append(f"   Elapsed:   {elapsed_str}")
         lines.append("")
+        lines.append(" Detailed Pipeline Metrics:")
+        lines.append(f"   Fast-Path Validation (Skip LLM):   {self.fast_path:<5}")
+        lines.append(f"   Regex Domain AI-Bypasses:          {self.ai_bypass:<5}")
+        lines.append(f"   AI Inference Queries (Local LLM):  {self.ai_inference:<5}")
+        lines.append(f"   Ollama Timeout Failures:           {self.ollama_timeouts:<5}")
+        lines.append(f"   DuckDuckGo Search Queries:         {self.ddg_queries:<5}")
+        lines.append("")
         lines.append(" Results:")
         lines.append(f"   Found:     {self.found:<5} |  Not found: {self.not_found:<5} |  Errors: {self.errors}")
         lines.append(f"   Hit Rate:  {hit_rate:.1f}%")
+        lines.append("")
+        lines.append(" Active Thread Channels:")
+        
+        # Format active workers sorted by thread name
+        sorted_threads = sorted(self.active_workers.keys())
+        for i in range(self.max_workers):
+            if i < len(sorted_threads):
+                t_name = sorted_threads[i]
+                info = self.active_workers[t_name]
+                w_dur = time.time() - info["start_time"]
+                # Truncate contact name for layout safety
+                contact_display = info["contact"]
+                if len(contact_display) > 30:
+                    contact_display = contact_display[:27] + "..."
+                lines.append(f"   [Slot {i+1}] {info['stage']:<10}: {contact_display:<30} ({w_dur:.1f}s elapsed)")
+            else:
+                lines.append(f"   [Slot {i+1}] IDLE")
+        
         lines.append("")
         lines.append(" Recent Activity:")
         for act in list(self.recent_activities):

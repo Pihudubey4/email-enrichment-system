@@ -29,7 +29,19 @@ class ValidationWorker:
         "getairmail.com", "maildrop.cc", "mintemail.com"
     }
 
-    def run(self, email: str, website: str) -> Dict[str, Any]:
+    # Directory / Aggregator / Portal domains to skip for domain validation check
+    DIRECTORY_DOMAINS = {
+        "zoominfo.com", "rocketreach.co", "linkedin.com", "npidb.org",
+        "npiprofile.com", "doximity.com", "healthgrades.com", "vitals.com",
+        "npino.com", "npi-lookup.org", "nationalprovider.org", "npinumberlookup.org",
+        "cms.gov", "medicare.gov", "data.cms.gov", "sec.gov", "bloomberg.com",
+        "bbb.org", "npi.gov", "health.ny.gov", "ncbi.nlm.nih.gov", "healthcare.gov",
+        "nppes.cms.hhs.gov", "opencorporates.com", "crunchbase.com", "preqin.com",
+        "adviserinfo.sec.gov", "wikipedia.org", "facebook.com", "twitter.com",
+        "instagram.com", "youtube.com", "yelp.com", "tripadvisor.com"
+    }
+
+    def run(self, email: str, website: str, enforce_domain_match: bool = True) -> Dict[str, Any]:
         """
         Validates the email and returns a structured validation report.
         
@@ -96,10 +108,17 @@ class ValidationWorker:
             result["reason"] = f"MX records check inconclusive: {mx_reason}"
             return result
 
-        # 7. Compare with target website domain if provided
+        # 7. Compare with target website domain if provided (if website is not a directory portal)
         if website:
             web_domain = self._extract_domain(website)
             if web_domain:
+                # If target website is a known directory/aggregator domain or a .gov site, do not enforce matching.
+                is_directory = web_domain.endswith(".gov") or any(d in web_domain or web_domain.endswith(f".{d}") for d in self.DIRECTORY_DOMAINS)
+                if is_directory or not enforce_domain_match:
+                    result["status"] = "Valid"
+                    result["reason"] = f"Valid format and domain resolves successfully ({email_domain})."
+                    return result
+                
                 if email_domain == web_domain or email_domain.endswith(f".{web_domain}"):
                     result["status"] = "Valid"
                     result["reason"] = "Email format is valid and domain matches target website."
