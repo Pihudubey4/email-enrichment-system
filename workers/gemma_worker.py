@@ -23,7 +23,7 @@ class GemmaWorker:
         self.endpoint = f"{config.OLLAMA_URL.rstrip('/')}/api/generate"
         self.prompt_template_path = config.PROMPTS_DIR / "email_extraction.txt"
 
-    def run(self, company: str, website: str, scraped_text: str) -> Tuple[str, float, str]:
+    def run(self, company: str, website: str, scraped_data: Dict[str, Any], tui: Any = None) -> Tuple[str, str, float, float, str, str]:
         """
         Queries local Ollama using the loaded prompt template.
         Expects a structured JSON response from Gemma.
@@ -31,22 +31,19 @@ class GemmaWorker:
         Args:
             company (str): Name of the target company or contact.
             website (str): Company website.
-            scraped_text (str): Extracted web content text.
+            scraped_data (Dict[str, Any]): Dictionary containing scraped text and fast path candidates.
             
         Returns:
-            Tuple[str, float, str]: A tuple of (email, confidence, reason).
+            Tuple[str, str, float, float, str, str]: A tuple of (email, phone, email_confidence, phone_confidence, reason, source_url).
         """
+        scraped_text = scraped_data.get("text", "")
+        fast_email = scraped_data.get("fast_email", "")
+        fast_phone = scraped_data.get("fast_phone", "")
+        source_url = scraped_data.get("source_url", "")
+
         if not scraped_text.strip():
             logger.warning(f"Empty scraped text received for {company}. Skipping AI worker.")
-            return "", 0.0, "No source text available to analyze."
-
-        # Fast path: if regex already extracted an email in the search worker, skip Ollama entirely
-        if scraped_text.startswith("FAST_EMAIL_FOUND:"):
-            first_line = scraped_text.split("\n")[0]
-            email = first_line.replace("FAST_EMAIL_FOUND:", "").strip()
-            if email and "@" in email:
-                logger.info(f"Fast-path bypass for {company}: using pre-extracted email {email}")
-                return email, 0.85, "Directly extracted via regex from scraped page."
+            return fast_email, fast_phone, 0.5 if fast_email else 0.0, 0.5 if fast_phone else 0.0, "No source text available to analyze.", source_url
 
         # Build prompt using the unified prompt builder function
         try:
@@ -59,8 +56,8 @@ class GemmaWorker:
                     template = f.read()
             else:
                 template = (
-                    "Extract the most probable business email for {company} / {website}.\n"
-                    "Return JSON: {{\"email\":\"\",\"confidence\":0.0,\"reason\":\"\"}}\n\n"
+                    "Extract the most probable business email and phone number for {company} / {website}.\n"
+                    "Return JSON: {{\"email\":\"\",\"phone\":\"\",\"email_confidence\":0.0,\"phone_confidence\":0.0,\"reason\":\"\"}}\n\n"
                     "Context:\n{context}"
                 )
             prompt = template.format(company=company, website=website, context=scraped_text)
@@ -70,7 +67,9 @@ class GemmaWorker:
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.0  # Keep extraction deterministic
+                "temperature": 0.0,  # Keep extraction deterministic
+                "num_predict": 256,  # Force stop after 256 tokens (stops infinite loops)
+                "num_ctx": 4096      # Keep context size optimized for speed
             },
             "format": "json"  # Instruct Ollama to output valid JSON
         }
@@ -95,26 +94,48 @@ class GemmaWorker:
                     try:
                         data = json.loads(response_text)
                         email = str(data.get("email", "")).strip()
-                        confidence = float(data.get("confidence", 0.0))
+                        phone = str(data.get("phone", "")).strip()
+                        email_confidence = float(data.get("email_confidence", data.get("confidence", 0.0)))
+                        phone_confidence = float(data.get("phone_confidence", data.get("confidence", 0.0)))
                         reason = str(data.get("reason", "")).strip()
-                        return email, confidence, reason
+
+                        # If LLM failed to extract, use regex fallbacks
+                        if not email and fast_email:
+                            email = fast_email
+                            email_confidence = 0.8
+                            reason += " (Used regex fast-path email)"
+                        if not phone and fast_phone:
+                            phone = fast_phone
+                            phone_confidence = 0.8
+                            reason += " (Used regex fast-path phone)"
+
+                        return email, phone, email_confidence, phone_confidence, reason, source_url
                     except (json.JSONDecodeError, TypeError, ValueError) as je:
                         logger.error(f"Failed to parse JSON response from Gemma: {response_text}. Error: {je}")
                         # Regular expression fallback parsing
                         email_match = re.search(r'"email"\s*:\s*"([^"]*)"', response_text)
-                        conf_match = re.search(r'"confidence"\s*:\s*([0-9.]+)', response_text)
-                        reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', response_text)
+                        phone_match = re.search(r'"phone"\s*:\s*"([^"]*)"', response_text)
+                        email_conf_match = re.search(r'"email_confidence"\s*:\s*([0-9.]+)', response_text)
+                        phone_conf_match = re.search(r'"phone_confidence"\s*:\s*([0-9.]+)', response_text)
                         
-                        email = email_match.group(1) if email_match else ""
-                        confidence = float(conf_match.group(1)) if conf_match else 0.0
-                        reason = reason_match.group(1) if reason_match else "Regex fallback parsed."
-                        return email, confidence, reason
+                        email = email_match.group(1) if email_match else fast_email
+                        phone = phone_match.group(1) if phone_match else fast_phone
+                        email_confidence = float(email_conf_match.group(1)) if email_conf_match else (0.8 if email else 0.0)
+                        phone_confidence = float(phone_conf_match.group(1)) if phone_conf_match else (0.8 if phone else 0.0)
+                        reason = "Regex fallback parsed."
+                        return email, phone, email_confidence, phone_confidence, reason, source_url
                 else:
                     logger.warning(f"Ollama returned non-200 code: {response.status_code}")
             except Exception as e:
+                is_timeout = isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ReadTimeout))
+                if is_timeout and tui is not None:
+                    try:
+                        tui.increment_metric("ollama_timeouts")
+                    except Exception:
+                        pass
                 logger.error(f"Error querying Ollama API: {e}. Retries left: {retries - 1}")
                 
             retries -= 1
             time.sleep(1.0)
             
-        return "", 0.0, "Ollama request failed after retries."
+        return fast_email, fast_phone, 0.7 if fast_email else 0.0, 0.7 if fast_phone else 0.0, "Ollama request failed. Used regex fast-path.", source_url

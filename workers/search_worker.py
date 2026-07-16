@@ -29,10 +29,21 @@ class SearchWorker:
     Designed for synchronous flow but easily adaptable to async (e.g. HTTPX or aiohttp).
     """
     # Thread-safe class level search results cache
-    _cache: Dict[str, str] = {}
+    _cache: Dict[str, Dict[str, Any]] = {}
     _lock = threading.Lock()
     # Lock to prevent concurrent search hits to DuckDuckGo/Bing
     _search_lock = threading.Lock()
+
+    DIRECTORY_DOMAINS = {
+        "zoominfo.com", "rocketreach.co", "linkedin.com", "npidb.org",
+        "npiprofile.com", "doximity.com", "healthgrades.com", "vitals.com",
+        "npino.com", "npi-lookup.org", "nationalprovider.org", "npinumberlookup.org",
+        "cms.gov", "medicare.gov", "data.cms.gov", "sec.gov", "bloomberg.com",
+        "bbb.org", "npi.gov", "health.ny.gov", "ncbi.nlm.nih.gov", "healthcare.gov",
+        "nppes.cms.hhs.gov", "opencorporates.com", "crunchbase.com", "preqin.com",
+        "adviserinfo.sec.gov", "wikipedia.org", "facebook.com", "twitter.com",
+        "instagram.com", "youtube.com", "yelp.com", "tripadvisor.com"
+    }
 
     def __init__(self) -> None:
         self.session = requests.Session()
@@ -53,6 +64,10 @@ class SearchWorker:
     _EMAIL_RE = re.compile(
         r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
     )
+    # Phone regex for extraction
+    _PHONE_RE = re.compile(
+        r'\(?[2-9][0-9]{2}\)?[-. ]?[0-9]{3}[-. ]?[0-9]{4}'
+    )
     # Trusted medical TLDs / domains that indicate professional email
     _MEDICAL_KEYWORDS = [
         '.edu', '.org', '.gov', 'health', 'medical', 'clinic', 'hospital',
@@ -60,13 +75,12 @@ class SearchWorker:
         'ortho', 'psych', 'neuro', 'cardio', 'peds', 'surg', 'md.', '.md'
     ]
 
-    def run(self, company: str, website: str) -> str:
+    def run(self, company: str, website: str, tui: Any = None) -> Dict[str, Any]:
         """
         Main entrypoint matching orchestrator requirements.
         Performs queries, scrapes pages, and aggregates everything into a single text block.
-        First attempts direct regex email extraction from scraped pages.
-        Only passes context to Gemma if emails are ambiguous or multiple candidates exist.
-        Includes a thread-safe cache lookup step.
+        Extracts candidate emails and phone numbers via regex.
+        Returns a dictionary of scraped data.
         """
         cache_key = f"{company.strip().lower()}|{website.strip().lower()}"
         
@@ -75,50 +89,67 @@ class SearchWorker:
                 logger.info(f"Cache hit for search data: {company} / {website}")
                 return self._cache[cache_key]
 
-        scraped_pages = self.search_and_scrape(company, website)
+        scraped_pages = self.search_and_scrape(company, website, tui)
         if not scraped_pages:
-            return ""
+            return {"text": "", "fast_email": "", "fast_phone": "", "source_url": ""}
         
-        # Fast path: extract all email candidates via regex across all pages
+        # Extract candidate emails and phones
         all_emails_found = []
+        all_phones_found = []
         for page in scraped_pages:
             text = page.get('text', '')
-            mailto_prefix = ''
+            url = page.get('url', '')
+            
             if text.startswith('Explicit Mailto Links Found:'):
                 first_line = text.split('\n')[0]
                 for email in self._EMAIL_RE.findall(first_line):
                     if not self._FAKE_EMAIL_PATTERN.search(email):
-                        all_emails_found.append((email, 'mailto', page['url']))
+                        all_emails_found.append((email, 'mailto', url))
             for email in self._EMAIL_RE.findall(text):
                 if not self._FAKE_EMAIL_PATTERN.search(email):
-                    all_emails_found.append((email, 'text', page['url']))
+                    all_emails_found.append((email, 'text', url))
+            
+            for phone in self._PHONE_RE.findall(text):
+                all_phones_found.append((phone.strip(), url))
         
-        # Prioritise mailto: emails, then medical-domain emails
+        # Pick the best email
+        best_email = ""
+        best_email_source = ""
         if all_emails_found:
             mailto_hits = [e for e in all_emails_found if e[1] == 'mailto']
             if mailto_hits:
-                best = mailto_hits[0][0]
-                logger.info(f"Fast-path mailto email found for {company}: {best}")
-                result = f"FAST_EMAIL_FOUND: {best}\n\n" + self._build_context(scraped_pages)
-                with self._lock:
-                    self._cache[cache_key] = result
-                return result
-            # Prefer medical-domain emails over generic
-            medical_hits = [e for e in all_emails_found if any(kw in e[0].lower() for kw in self._MEDICAL_KEYWORDS)]
-            if medical_hits:
-                best = medical_hits[0][0]
-                logger.info(f"Fast-path medical email found for {company}: {best}")
-                result = f"FAST_EMAIL_FOUND: {best}\n\n" + self._build_context(scraped_pages)
-                with self._lock:
-                    self._cache[cache_key] = result
-                return result
+                best_email = mailto_hits[0][0]
+                best_email_source = mailto_hits[0][2]
+            else:
+                medical_hits = [e for e in all_emails_found if any(kw in e[0].lower() for kw in self._MEDICAL_KEYWORDS)]
+                if medical_hits:
+                    best_email = medical_hits[0][0]
+                    best_email_source = medical_hits[0][2]
+                else:
+                    best_email = all_emails_found[0][0]
+                    best_email_source = all_emails_found[0][2]
+
+        # Pick the best phone
+        best_phone = ""
+        best_phone_source = ""
+        if all_phones_found:
+            best_phone = all_phones_found[0][0]
+            best_phone_source = all_phones_found[0][1]
 
         result_text = self._build_context(scraped_pages)
+        source_url = best_email_source or best_phone_source or (scraped_pages[0]['url'] if scraped_pages else "")
         
-        with self._lock:
-            self._cache[cache_key] = result_text
+        res = {
+            "text": result_text,
+            "fast_email": best_email,
+            "fast_phone": best_phone,
+            "source_url": source_url
+        }
 
-        return result_text
+        with self._lock:
+            self._cache[cache_key] = res
+
+        return res
 
     def _build_context(self, scraped_pages: List[Dict[str, str]]) -> str:
         """Combine scraped pages into a single context string for Gemma."""
@@ -131,7 +162,7 @@ class SearchWorker:
             )
         return "\n\n=== NEW PAGE ===\n\n".join(combined)
 
-    def search_and_scrape(self, company: str, website: str) -> List[Dict[str, str]]:
+    def search_and_scrape(self, company: str, website: str, tui: Any = None) -> List[Dict[str, str]]:
         """
         Executes DuckDuckGo queries for the company, extracts candidate URLs, 
         scrapes the target pages, and extracts clean text and metadata.
@@ -153,81 +184,97 @@ class SearchWorker:
             
         urls_to_scrape: Dict[str, str] = {}  # URL -> query used
         
-        # 1. Add primary website directly (query labeled as 'direct')
+        # Check if website is a directory/portal domain
+        is_directory = False
         if website:
+            web_domain = ""
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(website if website.startswith("http") else f"http://{website}")
+                web_domain = parsed.netloc.lower()
+                if web_domain.startswith("www."):
+                    web_domain = web_domain[4:]
+            except Exception:
+                pass
+            if web_domain:
+                is_directory = any(d in web_domain or web_domain.endswith(f".{d}") for d in self.DIRECTORY_DOMAINS)
+
+        # 1. Add primary website directly (query labeled as 'direct') if it's not a directory
+        if website and not is_directory:
             if not website.startswith("http"):
                 website = "https://" + website
             urls_to_scrape[website] = "direct_input"
 
         # 2. Define the search queries targeting name and keywords
         name_clean = name.strip()
+        name_clean = re.sub(r"^[^a-zA-Z0-9]+|[^a-zA-Z0-9)]+$", "", name_clean).strip()
         if "," in name_clean:
             name_clean = name_clean.split(",", 1)[0].strip()
-            
-        queries = [
-            f'"{name_clean}" email',
-            f'"{name_clean}" contact',
-        ]
-        if location_specialty:
-            keywords = location_specialty.replace(" practice in ", " ").replace(",", " ")
-            queries.append(f'"{name_clean}" {keywords} email')
-            queries.append(f'"{name_clean}" {keywords} contact')
-        else:
-            queries.append(f'"{name_clean}" about')
-            queries.append(f'"{name_clean}" leadership')
 
-        # 3. Query DuckDuckGo for candidate links
-        for query in queries:
-            logger.info(f"Querying DuckDuckGo: '{query}'")
-            candidate_links = self._search_query_with_retry(query)
+        city = ""
+        state = ""
+        if location_specialty:
+            match = re.search(r"practice in\s+([^,]+),\s*([A-Z]{2})", location_specialty, re.IGNORECASE)
+            if match:
+                city = match.group(1).strip()
+                state = match.group(2).strip()
+
+        if city and state:
+            primary_query = f'"{name_clean}" {city} {state} email'
+        else:
+            primary_query = f'"{name_clean}" email'
+
+        # 3. Query DuckDuckGo for candidate links (only 1 primary query first)
+        logger.info(f"Querying DuckDuckGo: '{primary_query}'")
+        if tui is not None:
+            try:
+                tui.increment_metric("ddg_queries")
+            except Exception:
+                pass
+        candidate_links = self._search_query_with_retry(primary_query)
+        
+        skipped_domains = list(self.DIRECTORY_DOMAINS) + [
+            "doubleclick.net", "baidu.com", "wikimedia.org", "wikidata.org",
+            "stackexchange.com", "stackoverflow.com", "github.com",
+            "microsoft.com", "answers.microsoft.com", "support.microsoft.com",
+            "apple.com", "docs.google.com", "mozilla.org",
+            "bbc.com", "cnn.com", "nytimes.com", "theguardian.com",
+            "reuters.com", "apnews.com", "nbcnews.com", "foxnews.com",
+            "usatoday.com", "washingtonpost.com",
+            "forbes.com", "businessinsider.com", "huffpost.com",
+            "imdb.com", "netflix.com", "hulu.com", "disneyplus.com",
+            "spotify.com", "gaana.com", "pandora.com", "soundcloud.com",
+            "m.imdb.com", "amazon.com", "ebay.com",
+            "acmilan.com", "espn.com", "nfl.com", "nba.com", "fifa.com",
+            "dominos.com", "ubereats.com", "grubhub.com", "doordash.com",
+            "fciqms.in", "aucklandpethospital.co.nz", "semanticscholar.org",
+            "researchgate.net", "elevenforum.com", "dorothyonfire.com"
+        ]
+
+        for link in candidate_links:
+            link_lower = link.lower()
+            if any(domain in link_lower for domain in skipped_domains):
+                continue
+            if link not in urls_to_scrape:
+                urls_to_scrape[link] = primary_query
+        time.sleep(config.SEARCH_DELAY)
+
+        # 3b. Fallback query if no links found and we used location-specific query
+        if not urls_to_scrape and city and state:
+            fallback_query = f'"{name_clean}" email'
+            logger.info(f"Primary query yielded no links. Trying fallback query: '{fallback_query}'")
+            if tui is not None:
+                try:
+                    tui.increment_metric("ddg_queries")
+                except Exception:
+                    pass
+            candidate_links = self._search_query_with_retry(fallback_query)
             for link in candidate_links:
-                # Skip known bot-blocking or non-business directories to target actual clinics
                 link_lower = link.lower()
-                skipped_domains = [
-                    # Directory / profile aggregators
-                    "zoominfo.com", "rocketreach.co", "linkedin.com", "npidb.org",
-                    "npiprofile.com", "doximity.com", "healthgrades.com", "vitals.com",
-                    "npino.com", "npi-lookup.org", "nationalprovider.org", "npinumberlookup.org",
-                    "cms.gov", "medicare.gov", "data.cms.gov",
-                    # Social media
-                    "facebook.com", "instagram.com", "youtube.com", "twitter.com",
-                    "tiktok.com", "pinterest.com", "reddit.com", "tumblr.com",
-                    # Search / ads / tracking
-                    "google.com", "bing.com", "yahoo.com", "doubleclick.net",
-                    "duckduckgo.com", "baidu.com",
-                    # Tech / dev / Q&A
-                    "wikipedia.org", "wikimedia.org", "wikidata.org",
-                    "stackexchange.com", "stackoverflow.com", "github.com",
-                    "microsoft.com", "answers.microsoft.com", "support.microsoft.com",
-                    "apple.com", "docs.google.com", "mozilla.org",
-                    # News / media
-                    "bbc.com", "cnn.com", "nytimes.com", "theguardian.com",
-                    "reuters.com", "apnews.com", "nbcnews.com", "foxnews.com",
-                    "usatoday.com", "washingtonpost.com", "bloomberg.com",
-                    "forbes.com", "businessinsider.com", "huffpost.com",
-                    # Entertainment / streaming
-                    "imdb.com", "netflix.com", "hulu.com", "disneyplus.com",
-                    "spotify.com", "gaana.com", "pandora.com", "soundcloud.com",
-                    "m.imdb.com", "amazon.com", "ebay.com",
-                    # Sports / misc
-                    "acmilan.com", "espn.com", "nfl.com", "nba.com", "fifa.com",
-                    # Knowledge bases / encyclopedias
-                    "britannica.com", "merriam-webster.com", "dictionary.com",
-                    # Food / lifestyle
-                    "dominos.com", "yelp.com", "tripadvisor.com", "doordash.com",
-                    "ubereats.com", "grubhub.com",
-                    # General aggregators that don't have emails
-                    "yellowpages.com", "whitepages.com", "spokeo.com", "beenverified.com",
-                    "usphonebook.com", "truepeoplesearch.com", "fastpeoplesearch.com",
-                    # Indian / irrelevant international portals showing up
-                    "fciqms.in", "aucklandpethospital.co.nz", "semanticscholar.org",
-                    "researchgate.net", "elevenforum.com", "dorothyonfire.com",
-                ]
                 if any(domain in link_lower for domain in skipped_domains):
                     continue
-                # Deduplicate links, prioritizing the first query that found it
                 if link not in urls_to_scrape:
-                    urls_to_scrape[link] = query
+                    urls_to_scrape[link] = fallback_query
             time.sleep(config.SEARCH_DELAY)
 
         # 4. Scrape the accumulated links (limit to top 3 pages for speed)
